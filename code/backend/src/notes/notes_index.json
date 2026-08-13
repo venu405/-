@@ -1,0 +1,58 @@
+{
+  "notes": [
+    {
+      "id": "note_20260812_161151_0",
+      "title": "任务 1: 法规门槛梳理",
+      "type": "task_state",
+      "tags": [
+        "deep_research",
+        "task_1"
+      ],
+      "created_at": "2026-08-12T16:11:51.916018"
+    },
+    {
+      "id": "note_20260812_161152_1",
+      "title": "任务 3: 地方标准差异",
+      "type": "task_state",
+      "tags": [
+        "deep_research",
+        "task_3"
+      ],
+      "created_at": "2026-08-12T16:11:52.988904"
+    },
+    {
+      "id": "note_20260812_161154_2",
+      "title": "任务 4: 例外情形界定",
+      "type": "task_state",
+      "tags": [
+        "deep_research",
+        "task_4"
+      ],
+      "created_at": "2026-08-12T16:11:54.521148"
+    },
+    {
+      "id": "note_20260812_161209_3",
+      "title": "任务 2: 采购方式区分",
+      "type": "task_state",
+      "tags": [
+        "deep_research",
+        "task_2"
+      ],
+      "created_at": "2026-08-12T16:12:09.675865"
+    },
+    {
+      "id": "note_20260812_161312_4",
+      "title": "研究报告：\"单笔采购超过多少需要招投标？\"",
+      "type": "conclusion",
+      "tags": [
+        "deep_research",
+        "report"
+      ],
+      "created_at": "2026-08-12T16:13:12.168952"
+    }
+  ],
+  "metadata": {
+    "created_at": "2026-08-12T16:11:43.757708",
+    "total_notes": 5
+  }
+}

@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 敏感配置（含 API key，禁止入库！）
+.env
+.env.local
+.env.*.local
+code/backend/.env
+
+# KB 本地数据（运行时生成，不入库）
+**/chroma_data/
+*.db
+*.db-shm
+*.db-wal
+**/_upload_*
+
+# 上传临时文件
+*_upload_*
+
+# Node / 前端
+node_modules/
+dist/
+.vite/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
