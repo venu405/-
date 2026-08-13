@@ -33,16 +33,17 @@ logger = logging.getLogger(__name__)
 MAX_RETRY = 1  # 生成后评估不达标，最多重试 1 次
 
 
-def _llm_invoke(llm, messages: list[dict[str, str]]) -> str:
+def _llm_invoke(llm, messages: list[dict[str, str]], model: str = "deepseek-chat") -> str:
     """统一 LLM 调用：兼容 OpenAI 客户端与 LangChain 风格 LLM。
 
-    - OpenAI 客户端（本项目实际使用）：llm.chat.completions.create(...)
+    - OpenAI 客户端（本项目实际使用）：llm.chat.completions.create(model=model, ...)
     - LangChain 风格（mock/其他）：llm.invoke(messages)
+
+    model 显式传参（P1 修复：去掉 llm._model 私有属性 hack，openai 升级不失效）。
     """
     if hasattr(llm, "invoke"):
         return str(llm.invoke(messages)).strip()
     # OpenAI 兼容客户端
-    model = getattr(llm, "_model", None) or "deepseek-chat"
     resp = llm.chat.completions.create(
         model=model,
         messages=messages,
@@ -76,6 +77,7 @@ def build_qa_graph(
     top_k: int = 5,
     hybrid: bool = True,
     checkpointer: Any = None,
+    model: str = "deepseek-chat",
 ) -> Any:
     """构建 LangGraph 问答图。llm 为 OpenAI 兼容客户端（DeepSeek）。
 
@@ -115,7 +117,7 @@ def build_qa_graph(
             f"当前问题：{question}\n"
             "只输出改写后的查询，不要解释。"
         )
-        rewritten = _llm_invoke(llm, [{"role": "user", "content": prompt}])
+        rewritten = _llm_invoke(llm, [{"role": "user", "content": prompt}], model=model)
         return {"rewritten": rewritten.strip() or question}
 
     def node_retrieve(state: QaState) -> dict[str, Any]:
@@ -150,13 +152,18 @@ def build_qa_graph(
             f"问题：{state['question']}\n"
             "回答："
         )
-        answer = _llm_invoke(llm, [{"role": "user", "content": prompt}])
+        answer = _llm_invoke(llm, [{"role": "user", "content": prompt}], model=model)
 
         # 引用元数据：与答案里的 [n] 对应
-        citations = [
+        all_citations = [
             {"index": i + 1, "chunk_id": h.get("chunk_id", ""), "text": h.get("text", "")[:120], "metadata": h.get("metadata", {})}
             for i, h in enumerate(state.get("contexts", []))
         ]
+        # P2 修复：只保留答案里实际引用的 [n] 且在有效范围内（防 LLM 编 [9] 悬空）
+        import re as _re
+
+        cited = {int(m) for m in _re.findall(r"\[(\d+)\]", answer)}
+        citations = [c for c in all_citations if c["index"] in cited and 1 <= c["index"] <= len(all_citations)]
         return {"answer": answer, "citations": citations}
 
     def _evaluate_faithfulness(state: QaState) -> tuple[int, bool]:
@@ -178,23 +185,23 @@ def build_qa_graph(
             f"[{i+1}] {p[:300]}" for i, p in enumerate(passages[:4])
         )
         prompt = (
-            "你是 RAG 质量评估员。判断下面的【答案】是否严格基于【资料】生成。\n"
-            "评分标准：\n"
-            "- 10 分：答案完全基于资料，无编造\n"
-            "- 7-9 分：基本基于资料，个别细节未直接对应\n"
-            "- 4-6 分：部分内容超出资料（可能幻觉）\n"
-            "- 0-3 分：答案与资料无关或大量编造\n\n"
-            "只输出一个 0-10 的整数，不要解释。\n\n"
+            "你是 RAG 质量评估员。从两个维度评估下面的【答案】：\n"
+            "1. 忠实度（是否严格基于资料，无编造）：10=完全基于，0=无关/编造\n"
+            "2. 相关性（是否回答了用户问题）：10=切题，0=答非所问\n\n"
+            f"【用户问题】{state.get('question', '')}\n"
             f"【资料】\n{context_block}\n\n"
-            f"【答案】\n{answer}"
+            f"【答案】\n{answer}\n\n"
+            "只输出两个 0-10 的整数，格式：忠实度 相关性（空格分隔），不要解释。"
         )
         try:
-            raw = _llm_invoke(llm, [{"role": "user", "content": prompt}])
+            raw = _llm_invoke(llm, [{"role": "user", "content": prompt}], model=model)
             import re as _re
 
-            m = _re.search(r"\d+", raw)
-            score = int(m.group(0)) if m else 0
-            logger.info("RAG 忠实度评分: %d/10", score)
+            nums = _re.findall(r"\d+", raw)
+            faith = int(nums[0]) if nums else 0
+            relev = int(nums[1]) if len(nums) > 1 else faith
+            score = min(faith, relev)  # 取低分（任一维度差都算不达标）
+            logger.info("RAG 评估：忠实度 %d/10，相关性 %d/10，取低 %d/10", faith, relev, score)
             return score, score >= 6
         except Exception:
             logger.warning("忠实度评估失败，退回规则检查")

@@ -1,0 +1,65 @@
+name: kb-assistant
+
+# 企业知识库管理助手 · Docker Compose 编排
+# 一条命令拉起全栈：docker compose up --build
+# 停止：docker compose down（数据卷保留）
+# 彻底清数据：docker compose down -v
+#
+# 服务拓扑：
+#   ollama (bge-m3, 内网 :11434)
+#     ↑
+#   backend (FastAPI :8000) ← env_file .env (LLM_API_KEY 等)
+#     ↑
+#   frontend (Vite :5174) → 浏览器经 localhost:8000 访问后端
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: kb-ollama
+    # 启动 ollama serve，等就绪后自动拉 bge-m3（首次约 2GB，后续秒过）
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["ollama serve & sleep 8 && ollama pull bge-m3 && wait"]
+    volumes:
+      - ollama_models:/root/.ollama
+    # 不映射端口到宿主机（仅 compose 内网）；后端通过 http://ollama:11434 访问
+    # 如需宿主机直连 ollama，取消下行注释（注意与宿主机 ollama 端口冲突）
+    # ports:
+    #   - "11434:11434"
+    restart: unless-stopped
+
+  backend:
+    build: ./code/backend
+    container_name: kb-backend
+    environment:
+      # 连 compose 内网的 ollama（不是宿主机的 127.0.0.1）
+      KB_OLLAMA_HOST: http://ollama:11434
+      KB_EMBEDDING_MODE: bge_m3
+      KB_EMBEDDING_MODEL: bge-m3
+      # 数据放 /app/data，挂卷持久化（chroma + checkpoint + users db）
+      KB_CHROMA_DIR: /app/data/chroma_data
+    env_file:
+      # 加载 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL_ID 等（DeepSeek）
+      - code/backend/.env
+    volumes:
+      - kb_data:/app/data
+    ports:
+      - "8000:8000"
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+  frontend:
+    build: ./code/frontend
+    container_name: kb-frontend
+    environment:
+      # 浏览器在宿主机跑，经 localhost:8000 访问后端（后端端口已映射）
+      VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      - "5174:5174"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  ollama_models:   # bge-m3 模型缓存（首次拉取后持久化）
+  kb_data:         # chroma 向量库 + checkpoint + 用户权限 db

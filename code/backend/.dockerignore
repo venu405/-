@@ -1,0 +1,13 @@
+__pycache__
+*.pyc
+.venv
+venv
+chroma_data
+*.db
+*.db-shm
+*.db-wal
+.pytest_cache
+.ruff_cache
+.env
+tests
+_upload_*

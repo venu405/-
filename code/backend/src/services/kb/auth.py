@@ -28,6 +28,9 @@ class AuthStore:
 
     def __init__(self, db_path: str | Path):
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        # P3：WAL 模式 + busy_timeout，避免并发写时 "database is locked"
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (

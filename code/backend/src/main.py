@@ -116,9 +116,12 @@ def _build_config(payload: ResearchRequest) -> Configuration:
 def create_app() -> FastAPI:
     app = FastAPI(title="HelloAgents Deep Researcher")
 
+    # CORS：从配置读允许的来源（生产禁用 *；* + credentials 浏览器会拒）
+    _cfg = Configuration.from_env()
+    _cors_origins = [o.strip() for o in _cfg.cors_origins.split(",") if o.strip()] or ["*"]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=_cors_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -285,7 +288,7 @@ def create_app() -> FastAPI:
             api_key=cfg.llm_api_key,
             base_url=cfg.llm_base_url or None,
         )
-        llm._model = cfg.llm_model_id or "deepseek-chat"  # 供 qa_graph 适配器读取
+        # model 显式传给 build_qa_graph（P1：去掉 _model 私有属性 hack）
 
         from langgraph.checkpoint.sqlite import SqliteSaver
         from services.kb.auth import AuthStore
@@ -295,7 +298,10 @@ def create_app() -> FastAPI:
         # 注意：新版 from_conn_string 返回 context manager（需 with），应用生命周期内
         # 直接用 sqlite3 连接实例化（连接常驻，服务存活期间有效）
         checkpoint_path = Path(cfg.kb_chroma_dir).parent / "kb_checkpoints.db"
-        saver = SqliteSaver(sqlite3.connect(str(checkpoint_path), check_same_thread=False))
+        _ckpt_conn = sqlite3.connect(str(checkpoint_path), check_same_thread=False)
+        _ckpt_conn.execute("PRAGMA journal_mode=WAL")  # P3：并发写不 locked
+        _ckpt_conn.execute("PRAGMA busy_timeout=5000")
+        saver = SqliteSaver(_ckpt_conn)
 
         graph = qa_graph.build_qa_graph(
             llm=llm,
@@ -303,6 +309,7 @@ def create_app() -> FastAPI:
             vector_store=store,
             top_k=cfg.kb_top_k,
             checkpointer=saver,
+            model=cfg.llm_model_id or "deepseek-chat",
         )
 
         # P3 §3.4 / v3 §6.1：RBAC——用户与知识库访问权限（SQLite）

@@ -67,6 +67,11 @@ class Configuration(BaseModel):
         title="Retrieval Top-K",
         description="Number of chunks to retrieve for Q&A",
     )
+    cors_origins: str = Field(
+        default="http://localhost:5173,http://localhost:5174,http://localhost:3000",
+        title="CORS Origins",
+        description="逗号分隔的允许跨域来源（生产必须配具体域名，禁用 *；* + credentials 浏览器会拒）",
+    )
 
     max_web_research_loops: int = Field(
         default=3,
