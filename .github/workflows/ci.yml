@@ -21,7 +21,7 @@ jobs:
         working-directory: code/backend
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -r requirements.txt
 
       - name: Run tests
         working-directory: code/backend
