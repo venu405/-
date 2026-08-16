@@ -26,6 +26,12 @@ from services.reporter import ReportingService
 from services.search import dispatch_search, prepare_research_context
 from services.summarizer import SummarizationService
 from services.tool_events import ToolCallTracker
+from services.token_budget import (
+    CountingClient,
+    ResearchStats,
+    TokenBudget,
+    TokenBudgetExceeded,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,10 +44,27 @@ _STREAM_EVENT_TIMEOUT = 300
 class DeepResearchAgent:
     """Coordinator orchestrating TODO-based research workflow using HelloAgents."""
 
-    def __init__(self, config: Configuration | None = None) -> None:
-        """Initialise the coordinator with configuration and shared tools."""
+    def __init__(
+        self,
+        config: Configuration | None = None,
+        *,
+        token_budget: TokenBudget | None = None,
+        stats: ResearchStats | None = None,
+    ) -> None:
+        """Initialise the coordinator with configuration and shared tools.
+
+        token_budget: 若提供，则把 LLM 客户端替换为计数代理，超限时抛
+        TokenBudgetExceeded 终止研究（防费用失控）。
+        """
         self.config = config or Configuration.from_env()
         self.llm = self._init_llm()
+        self._token_budget = token_budget
+
+        # 注入 token 计数代理：拦截所有 chat.completions.create 调用
+        if token_budget is not None:
+            self.llm._client = CountingClient(
+                self.llm._client, token_budget, stats or ResearchStats()
+            )
 
         self.note_tool = (
             NoteTool(workspace=self.config.notes_workspace)
@@ -131,22 +154,29 @@ class DeepResearchAgent:
     def run(self, topic: str) -> SummaryStateOutput:
         """Execute the research workflow and return the final report."""
         state = SummaryState(research_topic=topic)
-        state.todo_items = self.planner.plan_todo_list(state)
-        self._drain_tool_events(state)
+        try:
+            state.todo_items = self.planner.plan_todo_list(state)
+            self._drain_tool_events(state)
 
-        if not state.todo_items:
-            logger.info("No TODO items generated; falling back to single task")
-            state.todo_items = [self.planner.create_fallback_task(state)]
+            if not state.todo_items:
+                logger.info("No TODO items generated; falling back to single task")
+                state.todo_items = [self.planner.create_fallback_task(state)]
 
-        for task in state.todo_items:
-            for _ in self._execute_task(state, task, emit_stream=False):
-                pass
+            for task in state.todo_items:
+                for _ in self._execute_task(state, task, emit_stream=False):
+                    pass
 
-        report = self.reporting.generate_report(state)
-        self._drain_tool_events(state)
-        state.structured_report = report
-        state.running_summary = report
-        self._persist_final_report(state, report)
+            report = self.reporting.generate_report(state)
+            self._drain_tool_events(state)
+            state.structured_report = report
+            state.running_summary = report
+            self._persist_final_report(state, report)
+        except TokenBudgetExceeded as exc:
+            logger.warning("Research aborted (token budget exceeded): %s", exc)
+            report = state.structured_report or state.running_summary or (
+                f"⚠️ 研究因 token 预算超限被终止：{exc}"
+            )
+            self._persist_final_report(state, report)
 
         return SummaryStateOutput(
             running_summary=report,
@@ -160,11 +190,22 @@ class DeepResearchAgent:
         logger.debug("Starting streaming research: topic=%s", topic)
         yield {"type": "status", "message": "初始化研究流程"}
 
-        state.todo_items = self.planner.plan_todo_list(state)
-        for event in self._drain_tool_events(state, step=0):
-            yield event
-        if not state.todo_items:
-            state.todo_items = [self.planner.create_fallback_task(state)]
+        try:
+            state.todo_items = self.planner.plan_todo_list(state)
+            for event in self._drain_tool_events(state, step=0):
+                yield event
+            if not state.todo_items:
+                state.todo_items = [self.planner.create_fallback_task(state)]
+        except TokenBudgetExceeded as exc:
+            logger.warning("Planner token budget exceeded: %s", exc)
+            yield {
+                "type": "budget_exceeded",
+                "detail": f"规划阶段 token 超限：{exc}",
+                "used": exc.used,
+                "limit": exc.limit,
+            }
+            yield {"type": "done"}
+            return
 
         channel_map: dict[int, dict[str, Any]] = {}
         for index, task in enumerate(state.todo_items, start=1):
@@ -230,6 +271,18 @@ class DeepResearchAgent:
 
                 for event in self._execute_task(state, task, emit_stream=True, step=step):
                     enqueue(event, task=task)
+            except TokenBudgetExceeded as exc:
+                logger.warning("Token budget exceeded in task %s: %s", task.id, exc)
+                enqueue(
+                    {
+                        "type": "budget_exceeded",
+                        "task_id": task.id,
+                        "detail": str(exc),
+                        "used": exc.used,
+                        "limit": exc.limit,
+                    },
+                    task=task,
+                )
             except Exception as exc:  # pragma: no cover - defensive guardrail
                 logger.exception("Task execution failed", exc_info=exc)
                 enqueue(
@@ -322,7 +375,18 @@ class DeepResearchAgent:
                 for thread in threads:
                     thread.join()
 
-        report = self.reporting.generate_report(state)
+        try:
+            report = self.reporting.generate_report(state)
+        except TokenBudgetExceeded as exc:
+            logger.warning("Reporter token budget exceeded: %s", exc)
+            yield {
+                "type": "budget_exceeded",
+                "detail": f"报告生成阶段 token 超限：{exc}",
+                "used": exc.used,
+                "limit": exc.limit,
+            }
+            report = f"⚠️ 研究因 token 预算超限被终止（已消耗 {exc.used} tokens）。已完成的研究内容见上方任务卡片。"
+
         final_step = len(state.todo_items) + 1
         for event in self._drain_tool_events(state, step=final_step):
             yield event

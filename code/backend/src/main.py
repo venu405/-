@@ -25,6 +25,7 @@ from loguru import logger  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
 from config import Configuration, SearchAPI  # noqa: E402
+from services.token_budget import TokenBudget, TokenBudgetExceeded, global_stats  # noqa: E402
 # DeepResearchAgent 已改为路由内懒加载：KB 功能独立运行，不依赖 hello_agents
 
 # ---- 统一日志：loguru 作为唯一后端，桥接标准 logging ----
@@ -218,14 +219,35 @@ def create_app() -> FastAPI:
     def health_check() -> Dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/admin/diag")
+    def admin_diag(request: Request) -> Dict[str, Any]:
+        """运行时诊断——暴露研究调用的累计统计（token 消耗、调用次数、超限次数）。
+
+        鉴权：若配置了 ADMIN_API_KEY 则要求 X-API-Key 头匹配（与 /research 相同）。
+        """
+        if _admin_key and request.headers.get("X-API-Key") != _admin_key:
+            raise HTTPException(status_code=401, detail="无效的 API Key")
+        stats = global_stats.snapshot()
+        stats["token_budget_limit"] = _cfg.research_token_budget
+        stats["rate_limiter"] = f"{_research_limiter._window}s / {_research_limiter._max} req"
+        return stats
+
     @app.post("/research", response_model=ResearchResponse)
     def run_research(payload: ResearchRequest, request: Request) -> ResearchResponse:
         _check_research_access(request)
         try:
             from agent import DeepResearchAgent  # 懒加载：研究功能需 hello_agents
             config = _build_config(payload)
-            agent = DeepResearchAgent(config=config)
+            budget = TokenBudget(limit=config.research_token_budget)
+            global_stats.record_run_start(payload.topic)
+            agent = DeepResearchAgent(config=config, token_budget=budget, stats=global_stats)
             result = agent.run(payload.topic)
+        except TokenBudgetExceeded as exc:
+            global_stats.record_budget_exceeded()
+            raise HTTPException(
+                status_code=429,
+                detail=f"研究因 token 预算超限被终止（{exc.used}/{exc.limit} tokens）。请缩小研究范围或提高 KB_RESEARCH_TOKEN_BUDGET",
+            ) from exc
         except ValueError as exc:  # Likely due to unsupported configuration
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:  # pragma: no cover - defensive guardrail
@@ -257,13 +279,17 @@ def create_app() -> FastAPI:
         try:
             from agent import DeepResearchAgent  # 懒加载
             config = _build_config(payload)
-            agent = DeepResearchAgent(config=config)
+            budget = TokenBudget(limit=config.research_token_budget)
+            global_stats.record_run_start(payload.topic)
+            agent = DeepResearchAgent(config=config, token_budget=budget, stats=global_stats)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         def event_iterator() -> Iterator[str]:
             try:
                 for event in agent.run_stream(payload.topic):
+                    if event.get("type") == "budget_exceeded":
+                        global_stats.record_budget_exceeded()
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
             except Exception as exc:  # pragma: no cover - defensive guardrail
                 logger.exception("Streaming research failed")
@@ -286,7 +312,9 @@ def create_app() -> FastAPI:
         try:
             from agent import DeepResearchAgent  # 懒加载
             config = Configuration.from_env()
-            agent = DeepResearchAgent(config=config)
+            budget = TokenBudget(limit=config.research_token_budget)
+            global_stats.record_run_start(payload.topic)
+            agent = DeepResearchAgent(config=config, token_budget=budget, stats=global_stats)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

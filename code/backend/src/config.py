@@ -77,6 +77,11 @@ class Configuration(BaseModel):
         title="Admin API Key",
         description="深度研究接口的鉴权 key（可选）。配置后 /research* 接口要求 X-API-Key 头匹配；留空则不启用",
     )
+    research_token_budget: int = Field(
+        default=100_000,
+        title="Research Token Budget",
+        description="单次深度研究的 token 消耗上限（默认 100K ≈ ¥0.02 flash）。超限则强制终止研究，防止费用失控。可通过 KB_RESEARCH_TOKEN_BUDGET 环境变量覆盖",
+    )
 
     max_web_research_loops: int = Field(
         default=3,
@@ -187,6 +192,7 @@ class Configuration(BaseModel):
             "search_api": os.getenv("SEARCH_API"),
             "enable_notes": os.getenv("ENABLE_NOTES"),
             "notes_workspace": os.getenv("NOTES_WORKSPACE"),
+            "research_token_budget": os.getenv("KB_RESEARCH_TOKEN_BUDGET"),
         }
 
         for key, value in env_aliases.items():
