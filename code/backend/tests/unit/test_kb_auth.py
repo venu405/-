@@ -100,3 +100,70 @@ def test_invalid_role_rejected(tmp_path):
         assert False, "应抛出 ValueError"
     except ValueError:
         pass
+
+
+# ==================== 🟠4：token 鉴权 ====================
+
+def test_create_user_gets_token(tmp_path):
+    """新建用户自动获得 API token（kb_ 前缀，64+ 字符不可猜测）。"""
+    auth = AuthStore(str(tmp_path / "u.db"))
+    uid = auth.create_user("alice")
+    token = auth.get_token(uid)
+    assert token and token.startswith("kb_") and len(token) > 32
+
+
+def test_get_user_by_token(tmp_path):
+    """token 反查用户；无效/空 token 返回 None。"""
+    auth = AuthStore(str(tmp_path / "u.db"))
+    uid = auth.create_user("alice", role="admin")
+    token = auth.get_token(uid)
+
+    user = auth.get_user_by_token(token)
+    assert user is not None
+    assert user["user_id"] == uid
+    assert user["role"] == "admin"
+
+    assert auth.get_user_by_token("kb_invalid_token") is None  # 假 token
+    assert auth.get_user_by_token("") is None                   # 空
+    assert auth.get_user_by_token(None) is None                 # None
+
+
+def test_token_grants_same_access_as_user_id(tmp_path):
+    """token 与 user_id 权限等价（同一权限模型）。"""
+    auth = AuthStore(str(tmp_path / "u.db"))
+    uid = auth.create_user("alice")
+    token = auth.get_token(uid)
+    auth.grant_access(uid, "default")
+
+    assert auth.can_access(auth.get_user_by_token(token)["user_id"], "default") is True
+
+
+def test_reset_token_invalidates_old(tmp_path):
+    """重置 token 后旧 token 立即失效，新 token 可用。"""
+    auth = AuthStore(str(tmp_path / "u.db"))
+    uid = auth.create_user("alice")
+    old_token = auth.get_token(uid)
+
+    new_token = auth.reset_token(uid)
+    assert new_token and new_token != old_token
+    assert auth.get_user_by_token(old_token) is None  # 旧 token 失效
+    assert auth.get_user_by_token(new_token)["user_id"] == uid
+    assert auth.reset_token("nonexistent") is None
+
+
+def test_legacy_users_backfilled_with_token(tmp_path):
+    """历史无 token 用户：重开 AuthStore 时自动补发（迁移幂等）。"""
+    import sqlite3
+
+    db = str(tmp_path / "u.db")
+    auth = AuthStore(db)
+    uid = auth.create_user("legacy")
+    # 手动抹掉 token，模拟旧库数据
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE users SET api_token=NULL WHERE user_id=?", (uid,))
+    conn.commit()
+    conn.close()
+
+    auth2 = AuthStore(db)  # 重新打开触发迁移
+    token = auth2.get_token(uid)
+    assert token and auth2.get_user_by_token(token)["user_id"] == uid

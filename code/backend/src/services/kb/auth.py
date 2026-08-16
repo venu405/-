@@ -1,7 +1,7 @@
 """用户与权限管理（RBAC）——SQLite 存储（P3 §3.4 / v3 §6.1）。
 
 数据模型：
-  users(user_id PK, name, role, created_at)   role: member | admin
+  users(user_id PK, name, role, api_token, created_at)   role: member | admin
   kb_access(user_id, kb_id)                   -- member 可访问的知识库
 
 权限模型（本次审查修复后）：
@@ -9,19 +9,25 @@
   - member：只能访问 kb_access 里被授权的知识库（读写均可）
   - 越权防护在入口校验（检索层之前拦截），绝不放检索后再补救
 
-注：当前为"指定库 + 校验"最小版（kb_id 单库）。
-    v3 §6.1 的"跨库检索 where $in"为增强项，需 BM25 改多库索引，留作后续。
-    生产环境 user_id 应换 token 鉴权（当前 demo 级，请求直传 user_id）。
+鉴权（🟠4 修复）：每用户一个 API token（secrets 生成，存 users.api_token）。
+  请求带 X-Api-Token 头 → 反查 user_id；user_id 直传仍兼容（过渡期），
+  生产环境可用 KB_REQUIRE_TOKEN=1 强制只认 token。
 """
 from __future__ import annotations
 
 import logging
+import secrets
 import sqlite3
 import uuid
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _new_token() -> str:
+    """生成 API token（32 字节随机数的 hex，64 字符，不可猜测）。"""
+    return "kb_" + secrets.token_hex(32)
 
 
 class AuthStore:
@@ -40,6 +46,7 @@ class AuthStore:
                 user_id    TEXT PRIMARY KEY,
                 name       TEXT NOT NULL,
                 role       TEXT NOT NULL DEFAULT 'member',
+                api_token  TEXT,
                 created_at TEXT DEFAULT (datetime('now'))
             );
             CREATE TABLE IF NOT EXISTS kb_access (
@@ -49,26 +56,72 @@ class AuthStore:
             );
             """
         )
-        # 迁移：旧 users 表补 role 列（默认 member）
+        # 迁移：旧 users 表补 role / api_token 列（默认 member / NULL）
         cols = [r[1] for r in self._conn.execute("PRAGMA table_info(users)").fetchall()]
         if "role" not in cols:
             self._conn.execute(
                 "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'member'"
             )
+        if "api_token" not in cols:
+            self._conn.execute("ALTER TABLE users ADD COLUMN api_token TEXT")
+        # 🟠4：给历史无 token 的用户补发 token（幂等；token 泄露可 reset_token 换新）
+        rows = self._conn.execute(
+            "SELECT user_id FROM users WHERE api_token IS NULL OR api_token = ''"
+        ).fetchall()
+        for (uid,) in rows:
+            self._conn.execute(
+                "UPDATE users SET api_token=? WHERE user_id=?", (_new_token(), uid)
+            )
+        if rows:
+            logger.info("为 %d 个历史用户补发 API token", len(rows))
         self._conn.commit()
 
     # ---------- 用户 ----------
     def create_user(self, name: str, role: str = "member") -> str:
-        """新建用户，返回 user_id。role: member | admin。"""
+        """新建用户，返回 user_id。role: member | admin。
+
+        同时生成 API token（通过 get_token 取，仅在创建/重置时下发一次也可随时查）。
+        """
         if role not in self.VALID_ROLES:
             raise ValueError(f"非法角色: {role}")
         uid = uuid.uuid4().hex
         self._conn.execute(
-            "INSERT INTO users(user_id, name, role) VALUES(?, ?, ?)", (uid, name, role)
+            "INSERT INTO users(user_id, name, role, api_token) VALUES(?, ?, ?, ?)",
+            (uid, name, role, _new_token()),
         )
         self._conn.commit()
         logger.info("新建用户 name=%s id=%s role=%s", name, uid, role)
         return uid
+
+    def get_token(self, user_id: str) -> str | None:
+        """取用户 API token（管理员界面/创建响应用）。"""
+        row = self._conn.execute(
+            "SELECT api_token FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def reset_token(self, user_id: str) -> str | None:
+        """重置用户 API token（泄露时用）。用户不存在返回 None。"""
+        if not self.get_user(user_id):
+            return None
+        token = _new_token()
+        self._conn.execute(
+            "UPDATE users SET api_token=? WHERE user_id=?", (token, user_id)
+        )
+        self._conn.commit()
+        logger.info("重置 API token: user_id=%s", user_id)
+        return token
+
+    def get_user_by_token(self, token: str) -> dict[str, Any] | None:
+        """按 API token 反查用户（鉴权入口）。无效 token 返回 None。"""
+        if not token:
+            return None
+        row = self._conn.execute(
+            "SELECT user_id FROM users WHERE api_token=?", (token,)
+        ).fetchone()
+        if not row:
+            return None
+        return self.get_user(row[0])
 
     def get_user(self, user_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(

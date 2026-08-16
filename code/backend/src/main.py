@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import time
 from collections import deque
@@ -17,7 +18,7 @@ from dotenv import load_dotenv
 _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_ENV_PATH, override=True)
 
-from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile  # noqa: E402
+from fastapi import Body, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import StreamingResponse  # noqa: E402
 from loguru import logger  # noqa: E402
@@ -411,7 +412,7 @@ def create_app() -> FastAPI:
         """
         if not user_id:
             if required:
-                raise HTTPException(status_code=401, detail="此操作需提供 user_id（身份）")
+                raise HTTPException(status_code=401, detail="此操作需提供身份（token 或 user_id）")
             return
         if not kb["auth"].can_access(user_id, kb_id):
             raise HTTPException(
@@ -422,9 +423,37 @@ def create_app() -> FastAPI:
     def _require_admin(kb: dict, user_id: str | None) -> None:
         """管理员校验——用户/权限管理接口专用。缺身份 401，非 admin 403。"""
         if not user_id:
-            raise HTTPException(status_code=401, detail="此操作需管理员身份（user_id）")
+            raise HTTPException(status_code=401, detail="此操作需管理员身份（token 或 user_id）")
         if not kb["auth"].is_admin(user_id):
             raise HTTPException(status_code=403, detail=f"用户 {user_id} 无管理员权限")
+
+    # 🟠4：token 鉴权解析——X-Api-Token 头优先，user_id 直传回退（过渡期兼容）
+    _REQUIRE_TOKEN = bool(os.getenv("KB_REQUIRE_TOKEN", "").strip() not in ("", "0", "false"))
+
+    def _resolve_user_id(
+        kb: dict, x_api_token: str | None, user_id: str | None
+    ) -> str | None:
+        """把请求凭据解析为 user_id。
+
+        优先级：X-Api-Token 头（反查 users.api_token）> user_id 直传（兼容旧客户端）。
+        - token 存在但无效 → 401（防止拿假 token 配 user_id 冒充）
+        - 仅 user_id 且 KB_REQUIRE_TOKEN=1 → 401（生产强制 token）
+        - 两者都无 → None（由 _require_kb_access/_require_admin 决定 401 还是放行）
+        """
+        if x_api_token:
+            user = kb["auth"].get_user_by_token(x_api_token.strip())
+            if not user:
+                raise HTTPException(status_code=401, detail="无效的 API token")
+            return user["user_id"]
+        if user_id:
+            if _REQUIRE_TOKEN:
+                raise HTTPException(
+                    status_code=401,
+                    detail="本服务要求 token 鉴权（X-Api-Token 头），不接受 user_id 直传",
+                )
+            logger.warning("user_id 直传已废弃，请改用 X-Api-Token: {}", user_id[:8])
+            return user_id
+        return None
 
     def _ingest_file(
         kb: dict, file: UploadFile, *, doc_id: str, title: str | None, kb_id: str
@@ -480,15 +509,17 @@ def create_app() -> FastAPI:
         title: str | None = Form(default=None),
         kb_id: str = Form(default="default"),
         user_id: str | None = Form(default=None),
+        x_api_token: str | None = Header(default=None),
     ) -> Dict[str, Any]:
         """上传文档入库：解析 → 分块 → 向量化 → 写入 Chroma（指定知识库）。
 
-        user_id 传则校验对该库的写权限，无权 403。
+        鉴权：X-Api-Token 头优先，user_id 直传兼容（KB_REQUIRE_TOKEN=1 时仅认 token）。
         """
         try:
             import uuid
 
             kb = _get_kb()
+            user_id = _resolve_user_id(kb, x_api_token, user_id)
             _require_kb_access(kb, user_id, kb_id, required=True)
             doc_id = uuid.uuid4().hex
             chunks_count, resolved_title = _ingest_file(
@@ -507,15 +538,18 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=f"入库失败: {exc}") from exc
 
     @app.post("/kb/ask")
-    def kb_ask(payload: KbAskRequest = Body(...)) -> Dict[str, Any]:
+    def kb_ask(
+        payload: KbAskRequest = Body(...), x_api_token: str | None = Header(default=None)
+    ) -> Dict[str, Any]:
         """基于知识库问答（LangGraph 编排）。
 
-        权限（P3 §3.4）：传 user_id 时校验对该 kb_id 的访问权，无权则 403。
+        权限（P3 §3.4）：X-Api-Token 头优先解析身份，无则 user_id 兼容；校验对该 kb_id 的访问权。
         """
         try:
             kb = _get_kb()
+            user_id = _resolve_user_id(kb, x_api_token, payload.user_id)
             # RBAC：越权在检索前拦截（绝不在生成后补救）
-            _require_kb_access(kb, payload.user_id, payload.kb_id)
+            _require_kb_access(kb, user_id, payload.kb_id)
             from services.kb import qa_graph
 
             result = qa_graph.run_qa(
@@ -533,13 +567,18 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=f"问答失败: {exc}") from exc
 
     @app.get("/kb/docs")
-    def kb_list_docs(kb_id: str | None = None, user_id: str | None = None) -> Dict[str, Any]:
+    def kb_list_docs(
+        kb_id: str | None = None,
+        user_id: str | None = None,
+        x_api_token: str | None = Header(default=None),
+    ) -> Dict[str, Any]:
         """列出知识库文档（按 doc_id 聚合）。kb_id 指定时只列该库。
 
-        user_id 传则按用户可访问范围过滤：指定 kb_id 校验权限；未指定则只返回可访问库的文档。
+        鉴权：X-Api-Token 头优先，user_id 直传兼容；按用户可访问范围过滤。
         """
         try:
             kb = _get_kb()
+            user_id = _resolve_user_id(kb, x_api_token, user_id)
             if user_id and kb_id:
                 _require_kb_access(kb, user_id, kb_id)
             docs = kb["store"].list_docs(kb_id=kb_id)
@@ -558,30 +597,38 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=f"查询失败: {exc}") from exc
 
     @app.get("/kb/kbs")
-    def kb_list_kbs(user_id: str | None = None) -> Dict[str, Any]:
+    def kb_list_kbs(
+        user_id: str | None = None, x_api_token: str | None = Header(default=None)
+    ) -> Dict[str, Any]:
         """列出所有知识库（kb_id 去重）——知识库管理界面用。
 
-        user_id 传则只返回该用户可访问的库。
+        鉴权：X-Api-Token 头优先，user_id 直传兼容；有身份则只返回可访问的库。
         """
         try:
             kb = _get_kb()
+            user_id = _resolve_user_id(kb, x_api_token, user_id)
             kbs = kb["store"].list_kbs()
             if user_id:
                 allowed = set(kb["auth"].get_allowed_kbs(user_id))
                 kbs = [k for k in kbs if k in allowed]
             return {"kbs": kbs}
+        except HTTPException:
+            raise  # 401/403 直接抛出，不被转 500
         except Exception as exc:
             logger.error("KB list kbs failed: {}", exc)
             raise HTTPException(status_code=500, detail=f"查询失败: {exc}") from exc
 
     @app.delete("/kb/docs/{doc_id}")
-    def kb_delete_doc(doc_id: str, user_id: str | None = None) -> Dict[str, Any]:
-        """删除文档及其全部分块。写操作必须带 user_id，并校验该文档所属库的访问权。"""
+    def kb_delete_doc(
+        doc_id: str, user_id: str | None = None, x_api_token: str | None = Header(default=None)
+    ) -> Dict[str, Any]:
+        """删除文档及其全部分块。写操作必须带身份，并校验该文档所属库的访问权。"""
         try:
             kb = _get_kb()
             # 鉴权：写操作强制身份 + 查 doc 所属库 → 校验访问权
+            user_id = _resolve_user_id(kb, x_api_token, user_id)
             if not user_id:
-                raise HTTPException(status_code=401, detail="此操作需提供 user_id（身份）")
+                raise HTTPException(status_code=401, detail="此操作需提供身份（token 或 user_id）")
             doc_kb = kb["store"].get_doc_kb_id(doc_id)
             if doc_kb:
                 _require_kb_access(kb, user_id, doc_kb, required=True)
@@ -600,14 +647,16 @@ def create_app() -> FastAPI:
         title: str | None = Form(default=None),
         kb_id: str = Form(default="default"),
         user_id: str | None = Form(default=None),
+        x_api_token: str | None = Header(default=None),
     ) -> Dict[str, Any]:
         """更新文档：先删旧分块，再用原 doc_id 重新解析入库（保持 doc_id 稳定）。
 
         保持 doc_id 不变 → 历史引用/书签不失效。kb_id 决定新归属（可跨库迁移）。
-        user_id 传则校验对目标 kb_id 的写权限，无权 403。
+        鉴权：X-Api-Token 头优先，user_id 直传兼容；校验对目标 kb_id 的写权限。
         """
         try:
             kb = _get_kb()
+            user_id = _resolve_user_id(kb, x_api_token, user_id)
             _require_kb_access(kb, user_id, kb_id, required=True)
             deleted = kb["store"].delete_doc(doc_id)
             chunks_count, resolved_title = _ingest_file(
@@ -630,15 +679,20 @@ def create_app() -> FastAPI:
 
     @app.post("/kb/users")
     def kb_create_user(name: str = Form(...), role: str = Form(default="member")) -> Dict[str, Any]:
-        """新建用户，返回 user_id。role: member | admin（admin 全通）。
+        """新建用户，返回 user_id 与 API token。role: member | admin（admin 全通）。
 
         注：本接口是「bootstrap 入口」——首个 admin 由这里创建，故暂不挂鉴权；
-            生产环境需换 token/API key 保护（demo 级，见 auth.py 顶部说明）。
+            生产环境需用 ADMIN_API_KEY 或内网防火墙保护（demo 级，见 auth.py 顶部说明）。
         """
         try:
             kb = _get_kb()
             uid = kb["auth"].create_user(name, role)
-            return {"user_id": uid, "name": name, "role": role}
+            return {
+                "user_id": uid,
+                "name": name,
+                "role": role,
+                "api_token": kb["auth"].get_token(uid),
+            }
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
@@ -646,11 +700,14 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=f"建用户失败: {exc}") from exc
 
     @app.get("/kb/users")
-    def kb_list_users(admin_id: str | None = Query(default=None)) -> Dict[str, Any]:
-        """列出所有用户及其可访问的知识库（需管理员）。"""
+    def kb_list_users(
+        admin_id: str | None = Query(default=None),
+        x_api_token: str | None = Header(default=None),
+    ) -> Dict[str, Any]:
+        """列出所有用户及其可访问的知识库（需管理员）。token/user_id 均可作身份。"""
         try:
             kb = _get_kb()
-            _require_admin(kb, admin_id)
+            _require_admin(kb, _resolve_user_id(kb, x_api_token, admin_id))
             return {"users": kb["auth"].list_users()}
         except HTTPException:
             raise
@@ -659,11 +716,15 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail=f"查询失败: {exc}") from exc
 
     @app.get("/kb/users/{user_id}")
-    def kb_get_user(user_id: str, admin_id: str | None = Query(default=None)) -> Dict[str, Any]:
+    def kb_get_user(
+        user_id: str,
+        admin_id: str | None = Query(default=None),
+        x_api_token: str | None = Header(default=None),
+    ) -> Dict[str, Any]:
         """用户详情（含可访问的 kb 列表，需管理员）。"""
         try:
             kb = _get_kb()
-            _require_admin(kb, admin_id)
+            _require_admin(kb, _resolve_user_id(kb, x_api_token, admin_id))
             user = kb["auth"].get_user(user_id)
             if not user:
                 raise HTTPException(status_code=404, detail="用户不存在")
@@ -676,12 +737,15 @@ def create_app() -> FastAPI:
 
     @app.post("/kb/users/{user_id}/access")
     def kb_grant_access(
-        user_id: str, kb_id: str = Form(...), admin_id: str | None = Query(default=None)
+        user_id: str,
+        kb_id: str = Form(...),
+        admin_id: str | None = Query(default=None),
+        x_api_token: str | None = Header(default=None),
     ) -> Dict[str, Any]:
         """授权用户访问某知识库（需管理员）。"""
         try:
             kb = _get_kb()
-            _require_admin(kb, admin_id)
+            _require_admin(kb, _resolve_user_id(kb, x_api_token, admin_id))
             if not kb["auth"].get_user(user_id):
                 raise HTTPException(status_code=404, detail="用户不存在")
             kb["auth"].grant_access(user_id, kb_id)
@@ -694,12 +758,15 @@ def create_app() -> FastAPI:
 
     @app.post("/kb/users/{user_id}/role")
     def kb_set_role(
-        user_id: str, role: str = Form(...), admin_id: str | None = Query(default=None)
+        user_id: str,
+        role: str = Form(...),
+        admin_id: str | None = Query(default=None),
+        x_api_token: str | None = Header(default=None),
     ) -> Dict[str, Any]:
         """设置用户角色（member | admin，需管理员）。"""
         try:
             kb = _get_kb()
-            _require_admin(kb, admin_id)
+            _require_admin(kb, _resolve_user_id(kb, x_api_token, admin_id))
             if not kb["auth"].get_user(user_id):
                 raise HTTPException(status_code=404, detail="用户不存在")
             ok = kb["auth"].set_role(user_id, role)
@@ -714,12 +781,15 @@ def create_app() -> FastAPI:
 
     @app.delete("/kb/users/{user_id}/access")
     def kb_revoke_access(
-        user_id: str, kb_id: str = Form(...), admin_id: str | None = Query(default=None)
+        user_id: str,
+        kb_id: str = Form(...),
+        admin_id: str | None = Query(default=None),
+        x_api_token: str | None = Header(default=None),
     ) -> Dict[str, Any]:
         """撤销用户对某知识库的访问权（需管理员）。"""
         try:
             kb = _get_kb()
-            _require_admin(kb, admin_id)
+            _require_admin(kb, _resolve_user_id(kb, x_api_token, admin_id))
             removed = kb["auth"].revoke_access(user_id, kb_id)
             return {"user_id": user_id, "kb_id": kb_id, "removed": removed}
         except HTTPException:
@@ -727,6 +797,26 @@ def create_app() -> FastAPI:
         except Exception as exc:
             logger.error("KB revoke failed: {}", exc)
             raise HTTPException(status_code=500, detail=f"撤销失败: {exc}") from exc
+
+    @app.post("/kb/users/{user_id}/token")
+    def kb_reset_token(
+        user_id: str,
+        admin_id: str | None = Query(default=None),
+        x_api_token: str | None = Header(default=None),
+    ) -> Dict[str, Any]:
+        """重置用户 API token（需管理员；token 泄露时用，旧 token 立即失效）。"""
+        try:
+            kb = _get_kb()
+            _require_admin(kb, _resolve_user_id(kb, x_api_token, admin_id))
+            if not kb["auth"].get_user(user_id):
+                raise HTTPException(status_code=404, detail="用户不存在")
+            token = kb["auth"].reset_token(user_id)
+            return {"user_id": user_id, "api_token": token}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error("KB reset token failed: {}", exc)
+            raise HTTPException(status_code=500, detail=f"重置 token 失败: {exc}") from exc
 
     return app
 

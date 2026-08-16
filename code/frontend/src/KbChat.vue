@@ -18,10 +18,19 @@ function toggleCites(i: number) {
 }
 const loading = ref(false);
 
-// 多库 + 用户（RBAC）：kb 列表 / 当前库 / 用户 ID，localStorage 持久化
+// 多库 + 用户（RBAC）：kb 列表 / 当前库 / API Token，localStorage 持久化
+// 🟠4 token 鉴权：值以 "kb_" 开头 → 走 X-Api-Token 头；
+// 旧值（明文 user_id）仍按 user_id 参数发送，过渡期兼容
 const kbs = ref<string[]>([]);
 const currentKb = ref(localStorage.getItem("kb_id") || "default");
-const userId = ref(localStorage.getItem("kb_user_id") || "");
+const userToken = ref(localStorage.getItem("kb_api_token") || localStorage.getItem("kb_user_id") || "");
+
+function isTokenAuth(): boolean {
+  return userToken.value.startsWith("kb_");
+}
+function authHeaders(): Record<string, string> {
+  return isTokenAuth() ? { "X-Api-Token": userToken.value } : {};
+}
 
 // 会话线程 ID：按库隔离（切换库换新 thread，避免跨库串历史）
 const threadId = ref(localStorage.getItem(`kb_thread_${currentKb.value}`) || `kb-${Date.now()}`);
@@ -37,8 +46,8 @@ const updatingDocId = ref("");
 // ---------- 知识库 ----------
 async function loadKbs() {
   try {
-    const q = userId.value ? `?user_id=${encodeURIComponent(userId.value)}` : "";
-    const resp = await fetch(`${baseURL}/kb/kbs${q}`);
+    const q = !isTokenAuth() && userToken.value ? `?user_id=${encodeURIComponent(userToken.value)}` : "";
+    const resp = await fetch(`${baseURL}/kb/kbs${q}`, { headers: authHeaders() });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
     kbs.value = data.kbs || [];
@@ -55,8 +64,8 @@ async function loadDocs() {
   try {
     const q = new URLSearchParams();
     q.set("kb_id", currentKb.value);
-    if (userId.value) q.set("user_id", userId.value);
-    const resp = await fetch(`${baseURL}/kb/docs?${q.toString()}`);
+    if (!isTokenAuth() && userToken.value) q.set("user_id", userToken.value);
+    const resp = await fetch(`${baseURL}/kb/docs?${q.toString()}`, { headers: authHeaders() });
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
     docs.value = data.docs || [];
@@ -74,8 +83,8 @@ async function onUpload(event: Event) {
     const form = new FormData();
     form.append("file", file);
     form.append("kb_id", currentKb.value);
-    if (userId.value) form.append("user_id", userId.value);
-    const resp = await fetch(`${baseURL}/kb/ingest`, { method: "POST", body: form });
+    if (!isTokenAuth() && userToken.value) form.append("user_id", userToken.value);
+    const resp = await fetch(`${baseURL}/kb/ingest`, { method: "POST", body: form, headers: authHeaders() });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
     uploadMsg.value = `入库成功：${data.title}，共 ${data.chunks} 个分块`;
@@ -89,8 +98,8 @@ async function onUpload(event: Event) {
 
 async function onDelete(docId: string) {
   try {
-    const q = userId.value ? `?user_id=${encodeURIComponent(userId.value)}` : "";
-    await fetch(`${baseURL}/kb/docs/${docId}${q}`, { method: "DELETE" });
+    const q = !isTokenAuth() && userToken.value ? `?user_id=${encodeURIComponent(userToken.value)}` : "";
+    await fetch(`${baseURL}/kb/docs/${docId}${q}`, { method: "DELETE", headers: authHeaders() });
     loadDocs();
   } catch (e) {
     uploadErr.value = `删除失败: ${(e as Error).message}`;
@@ -113,8 +122,8 @@ async function onUpdate(event: Event) {
     const form = new FormData();
     form.append("file", file);
     form.append("kb_id", currentKb.value);
-    if (userId.value) form.append("user_id", userId.value);
-    const resp = await fetch(`${baseURL}/kb/docs/${docId}`, { method: "PUT", body: form });
+    if (!isTokenAuth() && userToken.value) form.append("user_id", userToken.value);
+    const resp = await fetch(`${baseURL}/kb/docs/${docId}`, { method: "PUT", body: form, headers: authHeaders() });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
     uploadMsg.value = `更新成功：${data.title}，共 ${data.chunks} 个分块`;
@@ -130,7 +139,7 @@ async function onUpdate(event: Event) {
 // 切换知识库 / 用户：重新加载库与文档，并重置对话（换 thread）
 function onSwitchKb() {
   localStorage.setItem("kb_id", currentKb.value);
-  localStorage.setItem("kb_user_id", userId.value);
+  localStorage.setItem("kb_api_token", userToken.value);
   threadId.value = `kb-${Date.now()}`;
   localStorage.setItem(`kb_thread_${currentKb.value}`, threadId.value);
   messages.value = [];
@@ -156,13 +165,14 @@ async function onSend() {
   try {
     const resp = await fetch(`${baseURL}/kb/ask`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({
         question,
         history,
         kb_id: currentKb.value,
         thread_id: threadId.value,
-        user_id: userId.value || undefined,
+        // token 鉴权走头；明文 user_id 仅在旧值（非 kb_ 开头）时兼容发送
+        user_id: isTokenAuth() ? undefined : userToken.value || undefined,
       }),
     });
     const data = await resp.json();
@@ -201,8 +211,8 @@ loadDocs();
         </select>
       </label>
       <label class="field">
-        <span>用户 ID（问答可留空，上传/删除/更新需填）</span>
-        <input v-model="userId" placeholder="如 39f8...（写操作需此身份且有库权限）" @change="onSwitchKb" />
+        <span>API Token（问答可留空；上传/删除/更新需填。创建用户时下发，kb_ 开头）</span>
+        <input v-model="userToken" placeholder="如 kb_3af2...（写操作需此身份且有库权限）" @change="onSwitchKb" />
       </label>
     </section>
 
