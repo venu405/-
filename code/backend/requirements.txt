@@ -4,7 +4,7 @@ hello-agents==0.2.9
 tavily-python>=0.5.0
 python-dotenv==1.2.2
 requests>=2.31.0
-openai==3.0.0
+openai>=1.12.0,<2.0.0  # hello-agents==0.2.9 要求 openai<2（此前误钉 3.0.0 会导致 pip 解析冲突、CI 装依赖失败）
 uvicorn[standard]==0.52.1
 ddgs>=9.6.1
 loguru==0.7.3

@@ -118,7 +118,14 @@ def build_qa_graph(
             "只输出改写后的查询，不要解释。"
         )
         rewritten = _llm_invoke(llm, [{"role": "user", "content": prompt}], model=model)
-        return {"rewritten": rewritten.strip() or question}
+        # 🟡15：改写结果校验——LLM 返回寒暄/解释类垃圾文本时回退原问题，
+        # 避免垃圾文本被当检索词用（召回质量崩塌）。
+        # 合法改写应为单行短查询：含换行（解释/多段）或超长（跑题）都判为无效。
+        rewritten = rewritten.strip()
+        if not rewritten or "\n" in rewritten or len(rewritten) > 120:
+            logger.warning("查询改写结果异常（%.0f 字符），回退原问题", len(rewritten))
+            return {"rewritten": question}
+        return {"rewritten": rewritten}
 
     def node_retrieve(state: QaState) -> dict[str, Any]:
         """检索：混合检索（向量 + BM25 + RRF 融合）。"""
@@ -162,7 +169,14 @@ def build_qa_graph(
         # P2 修复：只保留答案里实际引用的 [n] 且在有效范围内（防 LLM 编 [9] 悬空）
         import re as _re
 
-        cited = {int(m) for m in _re.findall(r"\[(\d+)\]", answer)}
+        # 🟡14：只解析答案末尾行的引用标记——prompt 已要求"末尾标注引用"，
+        # 正文里的 [2026年]、"见[1]章节" 等不应被误判为引用；
+        # 末行无标记时回退全文扫描（兼容 LLM 内联标注的习惯）
+        non_empty_lines = [ln for ln in answer.splitlines() if ln.strip()]
+        citation_zone = non_empty_lines[-1] if non_empty_lines else ""
+        cited = {int(m) for m in _re.findall(r"\[(\d+)\]", citation_zone)}
+        if not cited:
+            cited = {int(m) for m in _re.findall(r"\[(\d+)\]", answer)}
         citations = [c for c in all_citations if c["index"] in cited and 1 <= c["index"] <= len(all_citations)]
         return {"answer": answer, "citations": citations}
 

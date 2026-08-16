@@ -29,6 +29,11 @@ from services.tool_events import ToolCallTracker
 
 logger = logging.getLogger(__name__)
 
+# 🟠9: 流式主循环单事件最长等待秒数。worker 卡死（如 LLM/搜索调用 hang 且
+# 客户端无超时）时队列不再有事件，主循环不能永久阻塞——超时则广播错误并
+# 中止流，保证前端必定能收到终止事件（error + done）
+_STREAM_EVENT_TIMEOUT = 300
+
 
 class DeepResearchAgent:
     """Coordinator orchestrating TODO-based research workflow using HelloAgents."""
@@ -271,10 +276,31 @@ class DeepResearchAgent:
 
         active_workers = len(state.todo_items)
         finished_workers = 0
+        timed_out = False
 
         try:
             while finished_workers < active_workers:
-                event = event_queue.get()
+                try:
+                    event = event_queue.get(timeout=_STREAM_EVENT_TIMEOUT)
+                except Empty:
+                    # 🟠9：空闲超时——还有 worker 没跑完但长时间无任何事件，
+                    # 判定为 worker 卡死，中止流（daemon 线程不阻塞进程退出）
+                    timed_out = True
+                    logger.error(
+                        "run_stream idle timeout after %ss, %d/%d worker(s) unfinished; aborting stream",
+                        _STREAM_EVENT_TIMEOUT,
+                        active_workers - finished_workers,
+                        active_workers,
+                    )
+                    yield {
+                        "type": "error",
+                        "detail": (
+                            f"任务执行超过 {_STREAM_EVENT_TIMEOUT} 秒无响应"
+                            "（可能 LLM/搜索调用挂起），本次研究流已中止，请稍后重试"
+                        ),
+                    }
+                    yield {"type": "done"}
+                    return
                 if event.get("type") == "__task_done__":
                     finished_workers += 1
                     continue
@@ -289,8 +315,12 @@ class DeepResearchAgent:
                     yield event
         finally:
             self._set_tool_event_sink(None)
-            for thread in threads:
-                thread.join()
+            if timed_out:
+                # 卡死的 worker 是 daemon 线程：join 会永远等，跳过（进程退出时自动回收）
+                pass
+            else:
+                for thread in threads:
+                    thread.join()
 
         report = self.reporting.generate_report(state)
         final_step = len(state.todo_items) + 1
@@ -767,7 +797,7 @@ class DeepResearchAgent:
 
             note_id = parameters.get("note_id")
             if not note_id:
-                note_id = self._tool_tracker._extract_note_id(event.get("result", ""))  # type: ignore[attr-defined]
+                note_id = self._tool_tracker.extract_note_id(event.get("result", ""))
 
             if note_id:
                 return note_id

@@ -38,10 +38,14 @@ requires = ["setuptools>=73.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["src"]
+# 源码平铺在 src/ 下（config.py、agent.py 等顶层模块 + services 包），
+# package-dir 把 src 映射为安装根；packages.find 只扫 src，
+# 顶层 .py 文件用 py-modules 显式声明（否则 pip install -e . 报 src/src 不存在）
+package-dir = {"" = "src"}
+py-modules = ["agent", "config", "main", "models", "prompts", "utils"]
 
-[tool.setuptools.package-dir]
-"" = "src"
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.setuptools.package-data]
 "*" = ["py.typed"]

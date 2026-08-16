@@ -72,6 +72,11 @@ class Configuration(BaseModel):
         title="CORS Origins",
         description="逗号分隔的允许跨域来源（生产必须配具体域名，禁用 *；* + credentials 浏览器会拒）",
     )
+    admin_api_key: str = Field(
+        default="",
+        title="Admin API Key",
+        description="深度研究接口的鉴权 key（可选）。配置后 /research* 接口要求 X-API-Key 头匹配；留空则不启用",
+    )
 
     max_web_research_loops: int = Field(
         default=3,

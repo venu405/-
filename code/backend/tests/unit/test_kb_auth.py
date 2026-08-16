@@ -50,3 +50,53 @@ def test_grant_idempotent(tmp_path):
     auth.grant_access(uid, "default")
     auth.grant_access(uid, "default")  # 重复
     assert auth.get_allowed_kbs(uid) == ["default"]  # 仍只一条
+
+
+def test_create_admin_and_is_admin(tmp_path):
+    auth = AuthStore(str(tmp_path / "u.db"))
+    admin = auth.create_user("root", role="admin")
+    member = auth.create_user("alice")  # 默认 member
+    assert auth.is_admin(admin) is True
+    assert auth.is_admin(member) is False
+    assert auth.get_user(admin)["role"] == "admin"
+
+
+def test_admin_can_access_all(tmp_path):
+    """admin 全通：无需授权即可访问任意知识库。"""
+    auth = AuthStore(str(tmp_path / "u.db"))
+    admin = auth.create_user("root", role="admin")
+    member = auth.create_user("bob")
+    auth.grant_access(member, "default")
+
+    assert auth.can_access(admin, "任意库") is True  # admin 不需要授权
+    assert auth.can_access(member, "default") is True
+    assert auth.can_access(member, "其他库") is False  # member 未授权则拒
+
+
+def test_set_role(tmp_path):
+    """提升 member 为 admin / 降级。"""
+    auth = AuthStore(str(tmp_path / "u.db"))
+    uid = auth.create_user("carol")  # member
+    assert auth.is_admin(uid) is False
+
+    assert auth.set_role(uid, "admin") is True
+    assert auth.is_admin(uid) is True
+
+    assert auth.set_role(uid, "member") is True
+    assert auth.is_admin(uid) is False
+
+
+def test_invalid_role_rejected(tmp_path):
+    auth = AuthStore(str(tmp_path / "u.db"))
+    try:
+        auth.create_user("eve", role="superuser")
+        assert False, "应抛出 ValueError"
+    except ValueError:
+        pass
+
+    uid = auth.create_user("frank")
+    try:
+        auth.set_role(uid, "root")
+        assert False, "应抛出 ValueError"
+    except ValueError:
+        pass

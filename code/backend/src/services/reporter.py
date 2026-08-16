@@ -64,8 +64,12 @@ class ReportingService:
             f"如需输出汇总结论，可追加调用：[TOOL_CALL:note:{create_conclusion_template}] 保存报告要点。"
         )
 
-        response = self._agent.run(prompt)
-        self._agent.clear_history()
+        # try/finally：agent 是长生命周期对象，run 抛异常时也必须清 history，
+        # 否则下次 run 会带上残留上下文污染结果（参照 summarizer.py 的写法）
+        try:
+            response = self._agent.run(prompt)
+        finally:
+            self._agent.clear_history()
 
         report_text = response.strip()
         if self._config.strip_thinking_tokens:

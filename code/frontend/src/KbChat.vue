@@ -10,7 +10,6 @@ interface Citation {
 }
 const messages = ref<{ role: "user" | "assistant"; content: string; score?: number; citations?: Citation[] }[]>([]);
 const input = ref("");
-// 引用溯源：默认收起，点击展开（v3 §6.3）
 const expandedCites = ref<Set<number>>(new Set());
 function toggleCites(i: number) {
   const s = new Set(expandedCites.value);
@@ -18,16 +17,46 @@ function toggleCites(i: number) {
   expandedCites.value = s;
 }
 const loading = ref(false);
-// P4：会话线程 ID——localStorage 持久化，跨刷新保持同一对话（后端按 thread_id 持久化状态）
-const threadId = ref(localStorage.getItem("kb_thread_id") || `kb-${Date.now()}`);
-const docs = ref<{ doc_id: string; title: string; chunks: number }[]>([]);
+
+// 多库 + 用户（RBAC）：kb 列表 / 当前库 / 用户 ID，localStorage 持久化
+const kbs = ref<string[]>([]);
+const currentKb = ref(localStorage.getItem("kb_id") || "default");
+const userId = ref(localStorage.getItem("kb_user_id") || "");
+
+// 会话线程 ID：按库隔离（切换库换新 thread，避免跨库串历史）
+const threadId = ref(localStorage.getItem(`kb_thread_${currentKb.value}`) || `kb-${Date.now()}`);
+
+interface Doc { doc_id: string; title: string; chunks: number; kb_id?: string; source_type?: string }
+const docs = ref<Doc[]>([]);
 const uploadMsg = ref("");
 const uploadErr = ref("");
+
+// 更新文档：记录待更新的 doc_id，复用 PUT 接口（保持 doc_id 稳定）
+const updatingDocId = ref("");
+
+// ---------- 知识库 ----------
+async function loadKbs() {
+  try {
+    const q = userId.value ? `?user_id=${encodeURIComponent(userId.value)}` : "";
+    const resp = await fetch(`${baseURL}/kb/kbs${q}`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    kbs.value = data.kbs || [];
+    if (kbs.value.length && !kbs.value.includes(currentKb.value)) {
+      currentKb.value = kbs.value[0];
+    }
+  } catch (e) {
+    uploadErr.value = `加载知识库列表失败: ${(e as Error).message}`;
+  }
+}
 
 // ---------- 文档管理 ----------
 async function loadDocs() {
   try {
-    const resp = await fetch(`${baseURL}/kb/docs`);
+    const q = new URLSearchParams();
+    q.set("kb_id", currentKb.value);
+    if (userId.value) q.set("user_id", userId.value);
+    const resp = await fetch(`${baseURL}/kb/docs?${q.toString()}`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
     docs.value = data.docs || [];
@@ -35,7 +64,6 @@ async function loadDocs() {
     uploadErr.value = `加载文档列表失败: ${(e as Error).message}`;
   }
 }
-loadDocs();
 
 async function onUpload(event: Event) {
   const file = (event.target as HTMLInputElement).files?.[0];
@@ -45,10 +73,13 @@ async function onUpload(event: Event) {
   try {
     const form = new FormData();
     form.append("file", file);
+    form.append("kb_id", currentKb.value);
+    if (userId.value) form.append("user_id", userId.value);
     const resp = await fetch(`${baseURL}/kb/ingest`, { method: "POST", body: form });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
     uploadMsg.value = `入库成功：${data.title}，共 ${data.chunks} 个分块`;
+    (event.target as HTMLInputElement).value = "";
     loadDocs();
   } catch (e) {
     uploadErr.value = `入库失败: ${(e as Error).message}`;
@@ -58,11 +89,53 @@ async function onUpload(event: Event) {
 
 async function onDelete(docId: string) {
   try {
-    await fetch(`${baseURL}/kb/docs/${docId}`, { method: "DELETE" });
+    const q = userId.value ? `?user_id=${encodeURIComponent(userId.value)}` : "";
+    await fetch(`${baseURL}/kb/docs/${docId}${q}`, { method: "DELETE" });
     loadDocs();
   } catch (e) {
     uploadErr.value = `删除失败: ${(e as Error).message}`;
   }
+}
+
+// 更新文档：选中文件后走 PUT（先删旧分块，再用原 doc_id 重新入库）
+function pickUpdate(docId: string) {
+  updatingDocId.value = docId;
+  updateInput.value?.click();
+}
+const updateInput = ref<HTMLInputElement | null>(null);
+async function onUpdate(event: Event) {
+  const file = (event.target as HTMLInputElement).files?.[0];
+  const docId = updatingDocId.value;
+  if (!file || !docId) return;
+  uploadMsg.value = `正在更新 ${file.name}...`;
+  uploadErr.value = "";
+  try {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("kb_id", currentKb.value);
+    if (userId.value) form.append("user_id", userId.value);
+    const resp = await fetch(`${baseURL}/kb/docs/${docId}`, { method: "PUT", body: form });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
+    uploadMsg.value = `更新成功：${data.title}，共 ${data.chunks} 个分块`;
+    (event.target as HTMLInputElement).value = "";
+    updatingDocId.value = "";
+    loadDocs();
+  } catch (e) {
+    uploadErr.value = `更新失败: ${(e as Error).message}`;
+    uploadMsg.value = "";
+  }
+}
+
+// 切换知识库 / 用户：重新加载库与文档，并重置对话（换 thread）
+function onSwitchKb() {
+  localStorage.setItem("kb_id", currentKb.value);
+  localStorage.setItem("kb_user_id", userId.value);
+  threadId.value = `kb-${Date.now()}`;
+  localStorage.setItem(`kb_thread_${currentKb.value}`, threadId.value);
+  messages.value = [];
+  loadKbs();
+  loadDocs();
 }
 
 // ---------- 问答 ----------
@@ -73,7 +146,7 @@ async function onSend() {
   messages.value.push({ role: "user", content: question });
   input.value = "";
   loading.value = true;
-  localStorage.setItem("kb_thread_id", threadId.value);
+  localStorage.setItem(`kb_thread_${currentKb.value}`, threadId.value);
 
   // 传最近 6 轮历史（供 LangGraph 多轮改写）
   const history = messages.value
@@ -84,7 +157,13 @@ async function onSend() {
     const resp = await fetch(`${baseURL}/kb/ask`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question, history, kb_id: "default", thread_id: threadId.value }),
+      body: JSON.stringify({
+        question,
+        history,
+        kb_id: currentKb.value,
+        thread_id: threadId.value,
+        user_id: userId.value || undefined,
+      }),
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
@@ -100,6 +179,9 @@ async function onSend() {
     loading.value = false;
   }
 }
+
+loadKbs();
+loadDocs();
 </script>
 
 <template>
@@ -109,6 +191,21 @@ async function onSend() {
       <p class="sub">上传文档 → 向量化入库 → LangGraph 智能问答（带引用）</p>
     </header>
 
+    <!-- 知识库 + 用户选择（RBAC） -->
+    <section class="kb-selector">
+      <label class="field">
+        <span>知识库</span>
+        <select v-model="currentKb" @change="onSwitchKb">
+          <option v-for="k in kbs" :key="k" :value="k">{{ k }}</option>
+          <option v-if="!kbs.length" value="default">default</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>用户 ID（问答可留空，上传/删除/更新需填）</span>
+        <input v-model="userId" placeholder="如 39f8...（写操作需此身份且有库权限）" @change="onSwitchKb" />
+      </label>
+    </section>
+
     <!-- 文档管理区 -->
     <section class="upload-card">
       <div class="upload-row">
@@ -116,12 +213,15 @@ async function onSend() {
           📄 上传文档
           <input type="file" accept=".md,.txt,.pdf,.docx" hidden @change="onUpload" />
         </label>
+        <input ref="updateInput" type="file" accept=".md,.txt,.pdf,.docx" hidden @change="onUpdate" />
         <span class="upload-msg" :class="{ err: uploadErr }">{{ uploadErr || uploadMsg }}</span>
       </div>
       <div v-if="docs.length" class="doc-list">
         <div v-for="d in docs" :key="d.doc_id" class="doc-item">
           <span class="doc-title">📁 {{ d.title }}</span>
+          <span class="doc-kb">{{ d.kb_id }}</span>
           <span class="doc-chunks">{{ d.chunks }} 分块</span>
+          <button class="upd-btn" @click="pickUpdate(d.doc_id)">更新</button>
           <button class="del-btn" @click="onDelete(d.doc_id)">删除</button>
         </div>
       </div>
@@ -176,6 +276,15 @@ async function onSend() {
 }
 .kb-header h1 { font-size: 24px; margin: 0 0 4px; }
 .sub { color: #888; font-size: 13px; margin: 0 0 16px; }
+.kb-selector {
+  display: flex; gap: 16px; align-items: flex-end; margin-bottom: 16px;
+  background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 12px 16px;
+}
+.kb-selector .field { display: flex; flex-direction: column; gap: 4px; flex: 1; }
+.kb-selector .field span { font-size: 12px; color: #6b7280; }
+.kb-selector select, .kb-selector input {
+  padding: 8px 10px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; outline: none;
+}
 .upload-card, .chat-card {
   background: #fff; border: 1px solid #e5e7eb; border-radius: 12px;
   padding: 16px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.06);
@@ -193,7 +302,14 @@ async function onSend() {
   background: #f9fafb; border-radius: 6px; font-size: 13px;
 }
 .doc-title { flex: 1; }
+.doc-kb {
+  background: #eef2ff; color: #4f46e5; border-radius: 4px; padding: 1px 6px; font-size: 11px;
+}
 .doc-chunks { color: #888; font-size: 12px; }
+.upd-btn {
+  background: none; border: 1px solid #2563eb; color: #2563eb;
+  border-radius: 4px; padding: 2px 8px; cursor: pointer; font-size: 12px;
+}
 .del-btn {
   background: none; border: 1px solid #dc2626; color: #dc2626;
   border-radius: 4px; padding: 2px 8px; cursor: pointer; font-size: 12px;

@@ -32,6 +32,8 @@ class VectorStore:
             metadata={"hnsw:space": "cosine"},  # 余弦相似度（文本检索默认）
         )
         self._collection_name = collection_name
+        # 🟡12：迁移标记——实例存活期间已跑过 migrate_default_kb_id 就不再全表扫
+        self._migration_done = False
 
     @staticmethod
     def _merge_where(
@@ -136,18 +138,31 @@ class VectorStore:
 
         按 doc_id 删天然跨库安全——doc_id 全局唯一。
         """
-        result = self._collection.get(where={"doc_id": doc_id})
+        # 🟠11：只取 ids，不拉 documents/metadatas（默认 include 会带回全部内容）
+        result = self._collection.get(where={"doc_id": doc_id}, include=[])
         ids = result.get("ids", [])
         if ids:
             self._collection.delete(ids=ids)
             logger.info("Chroma 删除文档 %s 的 %d 个分块", doc_id, len(ids))
         return len(ids)
 
+    def get_doc_kb_id(self, doc_id: str) -> str | None:
+        """查文档所属知识库（删除前鉴权用）。找不到返回 None。"""
+        result = self._collection.get(where={"doc_id": doc_id}, include=["metadatas"])
+        for meta in result.get("metadatas", []) or []:
+            if meta and "kb_id" in meta:
+                return meta["kb_id"]
+        return None
+
     def count(self, *, kb_id: str | None = None) -> int:
-        """分块总数。kb_id 指定时只数该库（BM25 重建检测用）。"""
+        """分块总数。kb_id 指定时只数该库（BM25 重建检测用）。
+
+        🟠11：include=[] 只取 ids——默认 get 会连 documents/metadatas 一起拉回，
+        chunk 上万后每次 ask 的全表扫描开销翻倍。
+        """
         if kb_id is None:
             return self._collection.count()
-        result = self._collection.get(where={"kb_id": kb_id})
+        result = self._collection.get(where={"kb_id": kb_id}, include=[])
         return len(result.get("ids", []) or [])
 
     def all_items(
@@ -216,8 +231,14 @@ class VectorStore:
     def migrate_default_kb_id(self, kb_id: str = DEFAULT_KB_ID) -> int:
         """给历史无 kb_id 的 chunk 补默认 kb_id（P3 数据迁移）。幂等。
 
-        Chroma 不支持 $exists 操作符，故全量扫描后逐批 update。
+        🟡12：实例级"已迁移"标记——迁移只对旧版本写入的历史数据有意义，
+        运行期间新写入的 chunk 必然带 kb_id，故本实例跑过一次后直接跳过，
+        避免每次启动（_get_kb）都全表扫描。
         """
+        if self._migration_done:
+            return 0
+        self._migration_done = True  # 无论扫出多少条，本实例不再重复扫
+
         result = self._collection.get(include=["metadatas"])
         ids = result.get("ids", []) or []
         metas = result.get("metadatas", []) or []

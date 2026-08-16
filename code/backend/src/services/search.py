@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import OrderedDict
-from threading import Semaphore
+from threading import Lock, Semaphore
 from typing import Any, Optional, Tuple
 
 from hello_agents.tools import SearchTool
@@ -20,7 +21,20 @@ from utils import (
 logger = logging.getLogger(__name__)
 
 MAX_TOKENS_PER_SOURCE = 2000
-_GLOBAL_SEARCH_TOOL = SearchTool(backend="hybrid")
+
+# SearchTool 惰性初始化：避免 import 时即构建（可能触发网络/资源准备），
+# 全局共享一份实例，锁保护并发首用时的重复构建
+_GLOBAL_SEARCH_TOOL: Optional["SearchTool"] = None
+_search_tool_lock = Lock()
+
+
+def _get_search_tool() -> "SearchTool":
+    """按需构建全局 SearchTool（线程安全单例）。"""
+    global _GLOBAL_SEARCH_TOOL
+    with _search_tool_lock:
+        if _GLOBAL_SEARCH_TOOL is None:
+            _GLOBAL_SEARCH_TOOL = SearchTool(backend="hybrid")
+        return _GLOBAL_SEARCH_TOOL
 
 # ===== D4 改造②：搜索结果缓存 =====
 # P1-2-2: 用 OrderedDict 实现 LRU（最近最少使用淘汰），替代"满则全清"
@@ -30,13 +44,27 @@ _search_cache: OrderedDict[str, dict] = OrderedDict()
 _MAX_CACHE_SIZE = 100      # 最多缓存 100 条，防止字典无限膨胀
 _CACHE_TTL_SECONDS = 600   # 默认 10 分钟过期（见 _ttl_for_query 分档）
 
-# P1-1-1: 请求级搜索限流——最多同时 3 个搜索 API 请求（比任务级 Semaphore 更细粒度，
+# P1-1-1: 请求级搜索限流——同时搜索 API 请求数上限（比任务级 Semaphore 更细粒度，
 #         多轮研究时每任务多次搜索，任务级限流挡不住请求峰值）。
-# 注：数量暂为固定值 3，如需配置化可改为模块级重初始化（Semaphore 创建后不可变）。
-_SEARCH_SEMAPHORE = Semaphore(3)
+# 数量真正读取 MAX_CONCURRENT_SEARCHES 配置（与 config.py 字段对应），
+# 非法值兜底为 3；Semaphore 创建后不可变，故仅在模块加载时读取一次。
+def _init_search_semaphore() -> Semaphore:
+    try:
+        n = int(os.getenv("MAX_CONCURRENT_SEARCHES", "3"))
+    except (TypeError, ValueError):
+        n = 3
+    return Semaphore(max(1, n))
+
+
+_SEARCH_SEMAPHORE = _init_search_semaphore()
 
 # P1-2-4: 缓存命中率统计（每满 20 次请求输出一次）
 _cache_stats = {"hit": 0, "miss": 0}
+
+# 多 worker 线程并发读写缓存：get + move_to_end + LRU 淘汰是 check-then-act
+# 复合序列，GIL 只保证单个 dict 操作原子，不保证整个序列，需加锁保护
+# （_cache_stats 的读改写同样在锁内）
+_cache_lock = Lock()
 
 
 def _ttl_for_query(query: str) -> int:
@@ -49,8 +77,8 @@ def _ttl_for_query(query: str) -> int:
     return _CACHE_TTL_SECONDS  # 默认 10 分钟
 
 
-def _maybe_report_stats() -> None:
-    """P1-2-4: 每 20 次搜索请求报告一次命中率。"""
+def _maybe_report_stats_locked() -> None:
+    """P1-2-4: 每 20 次搜索请求报告一次命中率。调用方必须已持有 _cache_lock。"""
     total = _cache_stats["hit"] + _cache_stats["miss"]
     if total >= 20:
         rate = _cache_stats["hit"] / total * 100
@@ -71,26 +99,31 @@ def dispatch_search(
 
     search_api = get_config_value(config.search_api)
 
-    # ===== D4 改造②：缓存命中检查 =====
+    # ===== D4 改造②：缓存命中检查（加锁，见 _cache_lock 注释） =====
     cache_key = f"{search_api}:{config.fetch_full_page}:{query}"
     # key 含三要素：后端 + 全文开关 + 查询词（都影响返回内容，缺一个就会混用）
-    hit = _search_cache.get(cache_key)
-    if hit:
-        # P1-2-2: 命中即视为"最近使用"，移到末尾（LRU 淘汰时优先保它）
-        _search_cache.move_to_end(cache_key)
-        # P2-2-3: TTL 按条目存储（快变/慢变查询不同），命中判断用条目自身的 ttl
-        if (time.time() - hit["ts"]) < hit.get("ttl", _CACHE_TTL_SECONDS):
-            _cache_stats["hit"] += 1
-            _maybe_report_stats()
-            logger.info("Search cache HIT: %s", cache_key)
-            return hit["payload"], hit["notices"], hit["answer"], hit["backend"]
-    _cache_stats["miss"] += 1
-    _maybe_report_stats()
+    with _cache_lock:
+        hit = _search_cache.get(cache_key)
+        if hit:
+            # P1-2-2: 命中即视为"最近使用"，移到末尾（LRU 淘汰时优先保它）
+            _search_cache.move_to_end(cache_key)
+            # P2-2-3: TTL 按条目存储（快变/慢变查询不同），命中判断用条目自身的 ttl
+            if (time.time() - hit["ts"]) < hit.get("ttl", _CACHE_TTL_SECONDS):
+                _cache_stats["hit"] += 1
+                _maybe_report_stats_locked()
+                cached: tuple = (hit["payload"], hit["notices"], hit["answer"], hit["backend"])
+            else:
+                cached = None
+            if cached is not None:
+                logger.info("Search cache HIT: %s", cache_key)
+                return cached  # noqa: E501  (锁内 return，with 会自动释放)
+        _cache_stats["miss"] += 1
+        _maybe_report_stats_locked()
 
     try:
         # P1-1-1: 请求级限流——同时最多 3 个搜索请求（多轮研究时请求峰值防护）
         with _SEARCH_SEMAPHORE:
-            raw_response = _GLOBAL_SEARCH_TOOL.run(
+            raw_response = _get_search_tool().run(
                 {
                     "input": query,
                     "backend": search_api,
@@ -145,19 +178,20 @@ def dispatch_search(
     # P0-4: 空结果不缓存——否则空结果会被缓存（缓存毒化），
     #       期间所有相同查询持续拿空结果，且不会触发"降级为模型知识"分支。
     if results:
-        # P1-2-2: LRU 维护——已存在则移到末尾；容量满则淘汰最久未用的
-        if cache_key in _search_cache:
-            _search_cache.move_to_end(cache_key)
-        elif len(_search_cache) >= _MAX_CACHE_SIZE:
-            _search_cache.popitem(last=False)   # 淘汰最久未使用（替代"全清"）
-        _search_cache[cache_key] = {
-            "ts": time.time(),                       # 时间戳，供 TTL 判断用
-            "ttl": _ttl_for_query(query),            # P2-2-3: 按查询内容分档的过期时间
-            "payload": payload,
-            "notices": notices,
-            "answer": answer_text,
-            "backend": backend_label,
-        }
+        # P1-2-2: LRU 维护（加锁：move_to_end/popitem/写入是复合序列）
+        with _cache_lock:
+            if cache_key in _search_cache:
+                _search_cache.move_to_end(cache_key)
+            elif len(_search_cache) >= _MAX_CACHE_SIZE:
+                _search_cache.popitem(last=False)   # 淘汰最久未使用（替代"全清"）
+            _search_cache[cache_key] = {
+                "ts": time.time(),                       # 时间戳，供 TTL 判断用
+                "ttl": _ttl_for_query(query),            # P2-2-3: 按查询内容分档的过期时间
+                "payload": payload,
+                "notices": notices,
+                "answer": answer_text,
+                "backend": backend_label,
+            }
 
     return payload, notices, answer_text, backend_label
 

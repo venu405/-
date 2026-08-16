@@ -36,8 +36,12 @@ class PlanningService:
             research_topic=state.research_topic,
         )
 
-        response = self._agent.run(prompt)
-        self._agent.clear_history()
+        # try/finally：agent 是长生命周期对象，run 抛异常时也必须清 history，
+        # 否则下次 run 会带上残留上下文污染结果（参照 summarizer.py 的写法）
+        try:
+            response = self._agent.run(prompt)
+        finally:
+            self._agent.clear_history()
 
         logger.info("Planner raw output (truncated): %s", response[:500])
 

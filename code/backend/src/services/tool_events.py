@@ -56,7 +56,7 @@ class ToolCallTracker:
         if tool_name == "note":
             note_id = parsed_parameters.get("note_id")
             if note_id is None:
-                note_id = self._extract_note_id(result_text)
+                note_id = self.extract_note_id(result_text)
 
         event = ToolCallEvent(
             id=len(self._events) + 1,
@@ -205,7 +205,8 @@ class ToolCallTracker:
 
         return None
 
-    def _extract_note_id(self, response: str) -> Optional[str]:
+    def extract_note_id(self, response: str) -> Optional[str]:
+        """从工具返回文本中提取笔记 ID（公共方法：agent.py 也需要复用）。"""
         if not response:
             return None
 
